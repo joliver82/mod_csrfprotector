@@ -77,7 +77,7 @@
 " enabled in your web browser otherwise this site will fail to work correctly for you. " \
 " See details of your web browser for how to enable JavaScript."
 
-#define CSRFP_IGNORE_PATTERN ".*(jpg)|(jpeg)|(gif)|(png)|(js)|(css)|(xml)$"
+#define CSRFP_IGNORE_PATTERN ".*(jpg)|(jpeg)|(gif)|(png)|(js)|(css)|(xml)|(xsl)|(json)|(txt)|(csv)$"
 #define CSRFP_IGNORE_TEXT "csrfp_ignore_set"
 
 #define SQL_SESSID_DEFAULT_LENGTH 10
@@ -203,6 +203,7 @@ static void csrfp_sql_table_clean(request_rec *r, sqlite3 *db);
 static sqlite3 *csrfp_sql_init(request_rec *r);
 static int csrfp_sql_match(request_rec *r, sqlite3 *db, const char *sessid, const char *value);
 static int csrfp_sql_addn(request_rec *r, sqlite3 *db, const char *sessid, const char *value);
+static char* csrfp_sql_get_token(request_rec *r, sqlite3 *db, const char *sessid);
 static int csrfp_sql_update_counter(request_rec *r, sqlite3 *db);
 
 //=============================================================
@@ -350,25 +351,29 @@ static void setTokenCookie(request_rec *r, sqlite3 *db)
                                                 &csrf_protector_module);
     char *token = NULL, *cookie = NULL, *sessid = NULL;
 
-    // Generate a new token
-    token = generateToken(r, conf->tokenLength);
-
+    //SESSION PART
+    sessid = getCookieToken(r, CSRFP_SESS_TOKEN);
+    if (sessid == NULL) {
+        // Generate a new token
+        token = generateToken(r, conf->tokenLength);
+        sessid = generateToken(r, SQL_SESSID_DEFAULT_LENGTH);
+    }
+    else {
+        token = csrfp_sql_get_token(r, db, sessid);
+        if (token == NULL) {
+            token = generateToken(r, conf->tokenLength);
+        }
+    }
     // Send token as cookie header #todo - set expiry time of this token
     cookie = apr_psprintf(r->pool, "%s=%s; Version=1; Path=/;", conf->tokenName, token);
     apr_table_addn(r->headers_out, "Set-Cookie", cookie);
 
-    //SESSION PART
-    sessid = getCookieToken(r, CSRFP_SESS_TOKEN);
-    if (sessid == NULL) {
-        sessid = generateToken(r, SQL_SESSID_DEFAULT_LENGTH);       
-    }
-
-    // Add / Update it to database
-    csrfp_sql_addn(r, db, sessid, token);
-
     cookie = apr_psprintf(r->pool, "%s=%s; Version=1; Path=/; HttpOnly;", CSRFP_SESS_TOKEN, sessid);
     apr_table_addn(r->headers_out, "Set-Cookie", cookie);
 
+    // Add / Update it to database
+    csrfp_sql_addn(r, db, sessid, token);
+                  
     // Update counter & reseed if needed
     int counter = csrfp_sql_update_counter(r, db);
     if (counter == RESEED_RAND_AT) {
@@ -447,15 +452,20 @@ static int validateToken(request_rec *r, sqlite3 *db)
     apr_table_t *GET = NULL;
     GET = csrfp_get_query(r);
 
-    if (!GET) return 0;
-
-    //retrieve our CSRF_token from the table
     const char *tokenValue = NULL;
-    tokenValue = apr_table_get(GET, conf->tokenName);
-
+    // Extracting token
+    if (GET) {
+        tokenValue = apr_table_get(GET, conf->tokenName);
+    }
+    else {
+        tokenValue = apr_table_get(r->headers_in, conf->tokenName);
+    }
+    
+    // Verifying token
     if (!tokenValue) return 0;
     else {
         char *sessid = getCookieToken(r, CSRFP_SESS_TOKEN);
+        
         if (sessid == NULL) {
             return 0;
         }
@@ -840,6 +850,40 @@ static int csrfp_sql_update_counter(request_rec *r, sqlite3 *db)
 }
 
 /*
+ * Function: csrfp_sql_get_token
+ * Function to get token for session
+ *
+ * Parameters: 
+ * r - request_rec object
+ * db - sqlite database object
+ * sessid - session id for this user
+ *
+ * Returns: 
+ * char*
+ */
+static char* csrfp_sql_get_token(request_rec *r, sqlite3 *db, const char *sessid)
+{
+    char *result = NULL;
+    sqlite3_stmt *res;
+    const char *tail;
+    const char *sql = apr_psprintf(r->pool, "SELECT token FROM CSRFP WHERE sessid = '%s'", sessid);
+    int rc = sqlite3_prepare_v2(db, sql, 1000, &res, &tail);
+    if (rc != SQLITE_OK) {
+        #ifdef DEBUG
+            apr_table_addn(r->headers_out, "sql-addn-select-error", tail);
+        #endif
+        return rc;
+    } else {
+        while (sqlite3_step(res) == SQLITE_ROW) {
+            result = strdup((const char*)sqlite3_column_text(res, 0));
+            break;
+        }
+    }
+    sqlite3_reset(res);
+    return result;
+}
+
+/*
  * Function: csrfp_sql_addn
  * Function to add / Update token value in the db
  *
@@ -944,12 +988,18 @@ static int csrfp_sql_match(request_rec *r, sqlite3 *db, const char *sessid, cons
     } else {
         while (sqlite3_step(res) == SQLITE_ROW) {
             if (timestamp > (atoi(sqlite3_column_text(res, 0)) + TOKEN_EXPIRY_MAXTIME)) {
+                ap_log_rerror(APLOG_MARK, APLOG_NOERRNO|APLOG_ERR, 0, r,
+                        "CSRFP csrfp_sql_match return -1");
                 sqlite3_reset(res);
                 return -1;
             }
+            ap_log_rerror(APLOG_MARK, APLOG_NOERRNO|APLOG_ERR, 0, r,
+                "CSRFP csrfp_sql_match return 0");
             sqlite3_reset(res);
             return 0;
         }
+        ap_log_rerror(APLOG_MARK, APLOG_NOERRNO|APLOG_ERR, 0, r,
+              "CSRFP csrfp_sql_match return 1");
         return 1;
     }   
 }
@@ -969,7 +1019,8 @@ static int csrfp_sql_match(request_rec *r, sqlite3 *db, const char *sessid, cons
 static void csrfp_sql_table_clean(request_rec *r, sqlite3 *db)
 {
     int timestamp = (unsigned)time(NULL) - TOKEN_EXPIRY_MAXTIME;
-    char *sql = apr_psprintf(r->pool, "DELETE FROM CSRFP WHERE timestamp < '%d'", timestamp);
+    ap_log_rerror(APLOG_MARK, APLOG_NOERRNO|APLOG_ERR, 0, r,
+        "CSRFP cleaning %s.", sql);
     char *zErrMsg;
     int rc = sqlite3_exec(db, sql, 0, 0, &zErrMsg);
     if (rc != SQLITE_OK) {
