@@ -1019,14 +1019,15 @@ static int csrfp_sql_match(request_rec *r, sqlite3 *db, const char *sessid, cons
 static void csrfp_sql_table_clean(request_rec *r, sqlite3 *db)
 {
     int timestamp = (unsigned)time(NULL) - TOKEN_EXPIRY_MAXTIME;
-    ap_log_rerror(APLOG_MARK, APLOG_NOERRNO|APLOG_ERR, 0, r,
-        "CSRFP cleaning %s.", sql);
+    char *sql = apr_psprintf(r->pool, "DELETE FROM CSRFP WHERE timestamp < '%d'", timestamp);
     char *zErrMsg;
     int rc = sqlite3_exec(db, sql, 0, 0, &zErrMsg);
     if (rc != SQLITE_OK) {
         #ifdef DEBUG
             apr_table_addn(r->headers_out, "sql-clean-error", zErrMsg);
         #endif
+        ap_log_rerror(APLOG_MARK, APLOG_NOERRNO|APLOG_ERR, 0, r,
+            "CSRFP cleaning %s.", zErrMsg);
     }
 }
 //=====================================================================
@@ -1058,9 +1059,10 @@ static int csrfp_header_parser(request_rec *r)
     sqlite3 *db = csrfp_sql_init(r);
     if (db == NULL) {
         ap_log_rerror(APLOG_MARK, APLOG_NOERRNO|APLOG_ERR, 0, r,
-                      "CSRFP UNABLE TO ACCESS DB OBJECT");
+                      "CSRFP UNABLE TO ACCESS DB OBJECT IN HEADER PARSER");
         // #todo: ask Kevin/Abbas about this once
-        ap_rprintf(r, "OWASP CSRF Protector - SQLITE3 Database Open Error");
+        // Commented to avoid pages to be written
+        //ap_rprintf(r, "OWASP CSRF Protector - SQLITE3 Database Open Error");
         return DONE;
     }
 
@@ -1320,7 +1322,7 @@ static apr_status_t csrfp_out_filter(ap_filter_t *f, apr_bucket_brigade *bb)
         sqlite3 *db = csrfp_sql_init(r);
         if (db == NULL) {
             ap_log_rerror(APLOG_MARK, APLOG_NOERRNO|APLOG_ERR, 0, r,
-                      "CSRFP UNABLE TO ACCESS DB OBJECT");
+                      "CSRFP UNABLE TO ACCESS DB OBJECT IN FILTER FUNCTION");
         } else {
             setTokenCookie(r, db);
         }
